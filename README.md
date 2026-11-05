@@ -40,7 +40,7 @@ A `SpinPolicy<Relax, MaxBackoff>` sets two things:
   | hint | instruction | default on |
   |---|---|---|
   | `relax::Pause` | x86 `pause` | x86 |
-  | `relax::Isb` | AArch64 `isb sy` | AArch64 |
+  | `relax::Isb` | ARM `isb sy` (AArch64, and 32-bit ARMv7+) | AArch64 |
   | `relax::Yield` | ARM `yield` | 32-bit ARM |
 
   Most Cortex-A cores treat `yield` as a no-op, so it adds almost no delay. `isb` really stalls the core briefly, which is why it is the AArch64 default; Rust's spin loop uses it too. On a CPU a hint doesn't apply to, it compiles to a plain compiler barrier.
@@ -88,7 +88,12 @@ The first line of the benchmark output records the architecture, compiler, atomi
 | `medium` | about 100 dependent multiply-adds while holding the lock |
 | `nested` | `tiny`, but the lock is taken twice per op (recursive locks only) |
 
-**Fairness.** Every lock runs for a fixed time with the `tiny` workload, and each thread counts how many times it got the lock. A lock can show high throughput simply by letting one thread re-take it over and over while the others starve. The `min/mean` column shows the share of the least-served thread (1.00 = perfectly even).
+**Fairness.** Every lock runs for a fixed time with the `tiny` workload, and each thread counts how many times it got the lock. It runs twice:
+
+- `gap=0`: threads re-lock immediately after unlocking. This is the worst case.
+- `gap=100`: threads do about 100 multiply-adds of their own work between acquisitions, which is closer to how real code uses a lock.
+
+ A lock can show high throughput simply by letting one thread re-take it over and over while the others starve. The `min/mean` column shows the share of the least-served thread (1.00 = perfectly even).
 
 It compares:
 
@@ -97,7 +102,11 @@ It compares:
 - the previous implementation, as `v1::...` (`bench/spinlock_v1.hpp`). This is the code as originally provided, with one change: the race fix on `CRecursiveSpinlock`'s uncontended path. Without it the benchmark stops with "lost updates".
 - spin-policy variants of the current locks:
   - `[backoff1024]`: a 16× longer backoff before yielding;
-  - `[yield]`: on ARM only, the `yield` hint instead of the default `isb`.
+  - on 64-bit ARM, `[yield]`: the `yield` hint instead of the default `isb`;
+  - on 32-bit ARM, `[isb]`: the `isb` hint instead of the default `yield`.
+- two candidate fixes for `CSpinlock` starving waiters, from `bench/spinlock_candidates.hpp`:
+  - `TicketSpinlock`: strict first-come, first-served order;
+  - `CSpinlock[nobarge]` and `CSpinlock[nobarge32]`: a thread arriving while others are already waiting first gives them 256 or 32 hint calls to take the lock.
 
 By default the thread counts run 1, 2, 4, … up to the core count, then 2× the core count to show oversubscription.
 
@@ -154,3 +163,17 @@ What the results show:
 - **Remaining weak spot for `CRecursiveSpinlock`:** with exactly as many threads as cores (4) on short critical sections it is still 2–3× slower than the mutexes. Results there are bimodal (either about 50 or about 180 ns per acquisition), and moving `mRecursion` to its own cache line did not change that reliably.
 - **`CSpinlock`** speed is about the same as v1 on this machine. All differences are within run-to-run noise, and both are 2–5× faster than `std::mutex` on the `tiny` workload. Its rework mainly brought `try_lock`, the safe guard and somewhat less starvation at 8 threads. The cache-line benefit of test-and-test-and-set grows with core count, so a 4-vCPU VM is a poor place to see it.
 - **Fairness:** the spinlocks are generally less fair than the mutexes, especially once there are more threads than cores.
+
+### Dual Cortex-A9 (ARMv7, 32-bit)
+
+These come from the first run on the target, before the candidate locks and `gap=100` were added. The settings were `--ops 200000 --reps 5`, at 2 threads:
+
+| ns per acquisition | new | v1 | `std::` mutex |
+|---|---|---|---|
+| `CSpinlock`, tiny | 89 | 98 | 400 |
+| `CRecursiveSpinlock`, tiny | 99 | 221 | 417 |
+| `CRecursiveSpinlock`, nested | 102 | 344 | 591 |
+| `CSpinlock`, medium | 1401 | 1493 | 2430 |
+
+- **Throughput:** both spinlocks are 2–4× faster than the mutexes on short critical sections, and about 30–40% faster on medium ones. The recursive lock is 2–3× faster than v1.
+- **Fairness problem:** at `gap=0`, `CSpinlock` gave its least-served thread only **0.04** of a fair share, against 0.90 for v1. That is starvation. It did not reproduce on x86. The likely cause is that the releasing thread re-acquires the lock before a waiter, which only reads the lock, notices it was free. The candidate locks above are meant to fix this, and the `gap=100` run shows whether it matters with a realistic pattern.

@@ -7,7 +7,10 @@
 // Each configuration is repeated and the median is reported.
 //
 // A second "fairness" phase runs every lock for a fixed duration with the
-// tiny workload and counts how many acquisitions each thread got. A lock can
+// tiny workload and counts how many acquisitions each thread got. It runs
+// twice: with no gap between unlock and the next lock (the worst case, where
+// the releasing thread can immediately re-acquire), and with a gap of ~100
+// multiply-adds of thread-local work, closer to how real code uses a lock. A lock can
 // post great throughput by letting one thread re-acquire it over and over
 // while the others starve; the min/mean share exposes that (1.00 = perfectly
 // even, 0.00 = some thread never got the lock).
@@ -19,6 +22,7 @@
 // Usage:
 //   lock_benchmark [--ops N] [--reps N] [--threads 1,2,4,8] [--fairness-ms N] [--csv]
 
+#include "spinlock_candidates.hpp"
 #include "spinlock_v1.hpp"
 
 #include <locks/spinlock.hpp>
@@ -138,6 +142,8 @@ double runOnce(unsigned threads, uint64_t opsPerThread, const Workload &w)
 	return ns / double(total);
 }
 
+std::atomic<uint64_t> gSink{0};
+
 struct FairnessResult
 {
 	double mopsPerSec;
@@ -147,7 +153,7 @@ struct FairnessResult
 
 // Run for a fixed duration; each thread counts its own acquisitions.
 template <typename Lock>
-FairnessResult runFairness(unsigned threads, unsigned ms)
+FairnessResult runFairness(unsigned threads, unsigned ms, unsigned gapIters)
 {
 	Lock lock;
 	Shared shared;
@@ -168,14 +174,21 @@ FairnessResult runFairness(unsigned threads, unsigned ms)
 			std::this_thread::yield();
 		}
 		uint64_t n = 0;
+		uint64_t local = idx + 1;
 		while (!stop.load(std::memory_order_relaxed))
 		{
 			lock.lock();
 			doWork(shared, 0);
 			lock.unlock();
 			++n;
+			// Thread-local work between acquisitions (outside the lock).
+			for (unsigned i = 0; i < gapIters; ++i)
+			{
+				local = local * 6364136223846793005ULL + 1442695040888963407ULL;
+			}
 		}
 		counts[idx].count = n;
+		gSink.fetch_add(local, std::memory_order_relaxed); // keep the gap loop alive
 	};
 
 	std::vector<std::thread> pool;
@@ -219,7 +232,7 @@ struct Candidate
 	const char *name;
 	bool recursive;
 	std::function<double(unsigned, uint64_t, const Workload &)> run;
-	std::function<FairnessResult(unsigned, unsigned)> fairness;
+	std::function<FairnessResult(unsigned, unsigned, unsigned)> fairness;
 };
 
 template <typename Lock>
@@ -252,6 +265,8 @@ void printBuildInfo()
 	const char *atomics = "LSE (inline swp/cas)";
 #elif defined(__aarch64__)
 	const char *atomics = "no LSE at compile time (LL/SC loops, or outline-atomics calls if enabled)";
+#elif defined(__arm__)
+	const char *atomics = "LL/SC (ldrex/strex)";
 #else
 	const char *atomics = "native";
 #endif
@@ -260,8 +275,13 @@ void printBuildInfo()
 #else
 	const char *compiler = "unknown";
 #endif
-	std::printf("# build: arch=%s compiler=\"%s\" atomics=%s default_hint=%s max_backoff=%u\n",
-				arch, compiler, atomics, locks::relax::Default::name(), unsigned(LOCKS_SPIN_MAX_BACKOFF));
+#if defined(__ARM_ARCH)
+	const int armArch = __ARM_ARCH;
+#else
+	const int armArch = 0;
+#endif
+	std::printf("# build: arch=%s arm_arch=%d compiler=\"%s\" atomics=%s default_hint=%s max_backoff=%u\n",
+				arch, armArch, compiler, atomics, locks::relax::Default::name(), unsigned(LOCKS_SPIN_MAX_BACKOFF));
 }
 
 std::vector<unsigned> parseList(const char *s)
@@ -335,16 +355,23 @@ int main(int argc, char **argv)
 
 	const std::vector<Candidate> candidates = {
 		make<locks::CSpinlock>("CSpinlock", false),
-#if defined(__aarch64__) || defined(__arm__)
+#if defined(__aarch64__)
 		make<locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Yield> > >("CSpinlock[yield]", false),
+#elif defined(__arm__)
+		make<locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Isb> > >("CSpinlock[isb]", false),
 #endif
 		make<locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Default, 1024> > >("CSpinlock[backoff1024]", false),
+		make<locks::candidates::NoBargeSpinlock<> >("CSpinlock[nobarge]", false),
+		make<locks::candidates::NoBargeSpinlock<locks::SpinPolicy<>, 32> >("CSpinlock[nobarge32]", false),
+		make<locks::candidates::TicketSpinlock<> >("TicketSpinlock", false),
 		make<locks::v1::CSpinlock>("v1::CSpinlock", false),
 		make<boost::mutex>("boost::mutex", false),
 		make<std::mutex>("std::mutex", false),
 		make<locks::CRecursiveSpinlock>("CRecursiveSpinlock", true),
-#if defined(__aarch64__) || defined(__arm__)
+#if defined(__aarch64__)
 		make<locks::BasicRecursiveSpinlock<locks::SpinPolicy<locks::relax::Yield> > >("CRecursiveSpinlock[yield]", true),
+#elif defined(__arm__)
+		make<locks::BasicRecursiveSpinlock<locks::SpinPolicy<locks::relax::Isb> > >("CRecursiveSpinlock[isb]", true),
 #endif
 		make<locks::BasicRecursiveSpinlock<locks::SpinPolicy<locks::relax::Default, 1024> > >("CRecursiveSpinlock[backoff1024]", true),
 		make<locks::v1::CRecursiveSpinlock>("v1::CRecursiveSpinlock", true),
@@ -435,41 +462,45 @@ int main(int argc, char **argv)
 				fthreads.push_back(t);
 			}
 		}
-		if (!opt.csv)
-		{
-			std::printf("\n== fairness: tiny workload, %u ms per run ==\n"
-						"cells: Mops/s total | min/mean per-thread share (1.00 = even)\n%-32s",
-						opt.fairnessMs, "lock \\ threads");
-			for (unsigned t : fthreads)
-			{
-				std::printf("%16u", t);
-			}
-			std::printf("\n");
-		}
-		for (const auto &c : candidates)
+		const unsigned gaps[] = {0, 100};
+		for (unsigned gap : gaps)
 		{
 			if (!opt.csv)
 			{
-				std::printf("%-32s", c.name);
-				std::fflush(stdout);
-			}
-			for (unsigned t : fthreads)
-			{
-				const FairnessResult r = c.fairness(t, opt.fairnessMs);
-				if (opt.csv)
+				std::printf("\n== fairness: tiny workload, gap=%u, %u ms per run ==\n"
+							"cells: Mops/s total | min/mean per-thread share (1.00 = even)\n%-32s",
+							gap, opt.fairnessMs, "lock \\ threads");
+				for (unsigned t : fthreads)
 				{
-					std::printf("fairness,tiny,%s,%u,%.2f,%.3f,%.3f,%.3f\n", c.name, t,
-								1000.0 / r.mopsPerSec, r.mopsPerSec, r.minShare, r.maxShare);
+					std::printf("%16u", t);
 				}
-				else
+				std::printf("\n");
+			}
+			for (const auto &c : candidates)
+			{
+				if (!opt.csv)
 				{
-					std::printf("%9.1f | %4.2f", r.mopsPerSec, r.minShare);
+					std::printf("%-32s", c.name);
 					std::fflush(stdout);
 				}
-			}
-			if (!opt.csv)
-			{
-				std::printf("\n");
+				for (unsigned t : fthreads)
+				{
+					const FairnessResult r = c.fairness(t, opt.fairnessMs, gap);
+					if (opt.csv)
+					{
+						std::printf("fairness,tiny+gap%u,%s,%u,%.2f,%.3f,%.3f,%.3f\n", gap, c.name, t,
+									1000.0 / r.mopsPerSec, r.mopsPerSec, r.minShare, r.maxShare);
+					}
+					else
+					{
+						std::printf("%9.1f | %4.2f", r.mopsPerSec, r.minShare);
+						std::fflush(stdout);
+					}
+				}
+				if (!opt.csv)
+				{
+					std::printf("\n");
+				}
 			}
 		}
 	}

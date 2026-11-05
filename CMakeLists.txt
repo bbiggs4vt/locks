@@ -35,6 +35,7 @@ enable_testing()
 
 add_executable(spinlock_tests tests/spinlock_tests.cpp)
 target_link_libraries(spinlock_tests PRIVATE locks)
+target_include_directories(spinlock_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
 # Keep asserts on in the tests regardless of build type.
 target_compile_options(spinlock_tests PRIVATE -UNDEBUG)
 add_test(NAME spinlock_tests COMMAND spinlock_tests)

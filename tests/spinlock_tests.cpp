@@ -4,6 +4,8 @@
 
 #include <locks/spinlock.hpp>
 
+#include "spinlock_candidates.hpp"
+
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -233,6 +235,34 @@ void testSpinPolicies()
 		  "BasicRecursiveSpinlock<Default, 1024>");
 }
 
+void testCandidates()
+{
+	using namespace locks;
+	using namespace locks::candidates;
+	check(hammer<TicketSpinlock<> >(8, 20000, false), "TicketSpinlock mutual exclusion");
+	check(hammer<TicketSpinlock<SpinPolicy<relax::Default, 4> > >(8, 20000, false),
+		  "TicketSpinlock mutual exclusion (yield fallback)");
+	check(hammer<NoBargeSpinlock<> >(8, 20000, false), "NoBargeSpinlock mutual exclusion");
+	check(hammer<NoBargeSpinlock<SpinPolicy<relax::Default, 4>, 4> >(8, 20000, false),
+		  "NoBargeSpinlock mutual exclusion (yield fallback)");
+
+	TicketSpinlock<> t;
+	check(t.try_lock(), "TicketSpinlock::try_lock succeeds when free");
+	check(!tryLockFromOtherThread(t), "TicketSpinlock::try_lock fails when held");
+	t.unlock();
+	check(tryLockFromOtherThread(t), "TicketSpinlock::try_lock succeeds after unlock");
+	{
+		TicketSpinlock<>::scoped_lock g(t); // ticket counters stay consistent after try_lock
+	}
+	check(tryLockFromOtherThread(t), "TicketSpinlock usable after mixed try_lock/lock");
+
+	NoBargeSpinlock<> nb;
+	check(nb.try_lock(), "NoBargeSpinlock::try_lock succeeds when free");
+	check(!tryLockFromOtherThread(nb), "NoBargeSpinlock::try_lock fails when held");
+	nb.unlock();
+	check(tryLockFromOtherThread(nb), "NoBargeSpinlock::try_lock succeeds after unlock");
+}
+
 void testUnlockByNonOwnerAborts()
 {
 	// Run in a child process: unlocking from a thread that does not own the
@@ -262,6 +292,7 @@ int main()
 	testTryLock();
 	testStdLockCompatibility();
 	testSpinPolicies();
+	testCandidates();
 	testUnlockByNonOwnerAborts();
 
 	if (gFailures != 0)

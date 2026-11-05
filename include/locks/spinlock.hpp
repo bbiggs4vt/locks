@@ -60,15 +60,16 @@ namespace locks
 			}
 		};
 
-		//! AArch64 ISB SY. Flushes the pipeline, so unlike YIELD it actually
-		//! stalls the core for a short, roughly fixed time (Rust's
-		//! core::hint::spin_loop uses this on AArch64).
+		//! ARM ISB SY (AArch64, and 32-bit ARMv7+). Flushes the pipeline, so
+		//! unlike YIELD it actually stalls the core for a short, roughly fixed
+		//! time (Rust's core::hint::spin_loop uses this on AArch64).
+		//! On 32-bit ARM older than v7 it falls back to YIELD.
 		struct Isb
 		{
 			static const char *name() { return "isb"; }
 			static void relax()
 			{
-#if defined(LOCKS_ARCH_AARCH64)
+#if defined(LOCKS_ARCH_AARCH64) || (defined(LOCKS_ARCH_ARM32) && defined(__ARM_ARCH) && __ARM_ARCH >= 7)
 				__asm__ __volatile__("isb sy" ::: "memory");
 #elif defined(LOCKS_ARCH_ARM32)
 				__asm__ __volatile__("yield" ::: "memory");
