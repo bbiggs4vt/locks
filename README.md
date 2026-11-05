@@ -2,6 +2,8 @@
 
 Header-only spinlocks built on Boost, plus tests and a benchmark against regular mutexes.
 
+For the full review, see [`docs/spinlock-review.pdf`](docs/spinlock-review.pdf). It covers the issues found, the Cortex-A9 benchmark results, the starvation finding and when to use a spinlock instead of a mutex.
+
 - `locks::CSpinlock`: a non-recursive spinlock.
   - It uses test-and-test-and-set: waiters spin on a plain read and only attempt the atomic exchange when the lock looks free.
   - It waits with exponential backoff using the CPU pause instruction, then falls back to `yield()`.
