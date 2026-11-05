@@ -6,8 +6,19 @@
 // total number of acquisitions to give ns per acquisition (lower is better).
 // Each configuration is repeated and the median is reported.
 //
+// A second "fairness" phase runs every lock for a fixed duration with the
+// tiny workload and counts how many acquisitions each thread got. A lock can
+// post great throughput by letting one thread re-acquire it over and over
+// while the others starve; the min/mean share exposes that (1.00 = perfectly
+// even, 0.00 = some thread never got the lock).
+//
+// The previous spinlock implementation (bench/spinlock_v1.hpp) is included
+// as "v1::..." for comparison.
+//
 // Usage:
-//   lock_benchmark [--ops N] [--reps N] [--threads 1,2,4,8] [--csv]
+//   lock_benchmark [--ops N] [--reps N] [--threads 1,2,4,8] [--fairness-ms N] [--csv]
+
+#include "spinlock_v1.hpp"
 
 #include <locks/spinlock.hpp>
 
@@ -33,6 +44,7 @@ struct Options
 {
 	uint64_t opsPerThread = 200000;
 	unsigned reps = 5;
+	unsigned fairnessMs = 300; // 0 disables the fairness phase
 	std::vector<unsigned> threads;
 	bool csv = false;
 };
@@ -125,17 +137,94 @@ double runOnce(unsigned threads, uint64_t opsPerThread, const Workload &w)
 	return ns / double(total);
 }
 
+struct FairnessResult
+{
+	double mopsPerSec;
+	double minShare; // min per-thread acquisitions / mean
+	double maxShare; // max per-thread acquisitions / mean
+};
+
+// Run for a fixed duration; each thread counts its own acquisitions.
+template <typename Lock>
+FairnessResult runFairness(unsigned threads, unsigned ms)
+{
+	Lock lock;
+	Shared shared;
+	std::atomic<unsigned> ready{0};
+	std::atomic<bool> go{false};
+	std::atomic<bool> stop{false};
+
+	struct alignas(64) PerThread
+	{
+		uint64_t count = 0;
+	};
+	std::vector<PerThread> counts(threads);
+
+	auto body = [&](unsigned idx) {
+		ready.fetch_add(1);
+		while (!go.load(std::memory_order_acquire))
+		{
+			std::this_thread::yield();
+		}
+		uint64_t n = 0;
+		while (!stop.load(std::memory_order_relaxed))
+		{
+			lock.lock();
+			doWork(shared, 0);
+			lock.unlock();
+			++n;
+		}
+		counts[idx].count = n;
+	};
+
+	std::vector<std::thread> pool;
+	for (unsigned t = 0; t < threads; ++t)
+	{
+		pool.emplace_back(body, t);
+	}
+	while (ready.load() != threads)
+	{
+		std::this_thread::yield();
+	}
+	const auto start = std::chrono::steady_clock::now();
+	go.store(true, std::memory_order_release);
+	std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+	stop.store(true);
+	for (auto &th : pool)
+	{
+		th.join();
+	}
+	const auto end = std::chrono::steady_clock::now();
+
+	uint64_t total = 0, mn = UINT64_MAX, mx = 0;
+	for (const auto &c : counts)
+	{
+		total += c.count;
+		mn = std::min(mn, c.count);
+		mx = std::max(mx, c.count);
+	}
+	if (shared.counter != total)
+	{
+		std::fprintf(stderr, "ERROR: lost updates in fairness run\n");
+		std::exit(EXIT_FAILURE);
+	}
+	const double mean = double(total) / threads;
+	const double us = std::chrono::duration<double, std::micro>(end - start).count();
+	return FairnessResult{double(total) / us, mean > 0 ? mn / mean : 0.0, mean > 0 ? mx / mean : 0.0};
+}
+
 struct Candidate
 {
 	const char *name;
 	bool recursive;
 	std::function<double(unsigned, uint64_t, const Workload &)> run;
+	std::function<FairnessResult(unsigned, unsigned)> fairness;
 };
 
 template <typename Lock>
 Candidate make(const char *name, bool recursive)
 {
-	return Candidate{name, recursive, &runOnce<Lock>};
+	return Candidate{name, recursive, &runOnce<Lock>, &runFairness<Lock>};
 }
 
 double median(std::vector<double> v)
@@ -180,13 +269,17 @@ Options parseArgs(int argc, char **argv)
 		{
 			o.threads = parseList(argv[++i]);
 		}
+		else if (!std::strcmp(argv[i], "--fairness-ms") && i + 1 < argc)
+		{
+			o.fairnessMs = unsigned(std::strtoul(argv[++i], nullptr, 10));
+		}
 		else if (!std::strcmp(argv[i], "--csv"))
 		{
 			o.csv = true;
 		}
 		else
 		{
-			std::fprintf(stderr, "usage: %s [--ops N] [--reps N] [--threads 1,2,4,8] [--csv]\n", argv[0]);
+			std::fprintf(stderr, "usage: %s [--ops N] [--reps N] [--threads 1,2,4,8] [--fairness-ms N] [--csv]\n", argv[0]);
 			std::exit(EXIT_FAILURE);
 		}
 	}
@@ -212,9 +305,11 @@ int main(int argc, char **argv)
 
 	const std::vector<Candidate> candidates = {
 		make<locks::CSpinlock>("CSpinlock", false),
+		make<locks::v1::CSpinlock>("v1::CSpinlock", false),
 		make<boost::mutex>("boost::mutex", false),
 		make<std::mutex>("std::mutex", false),
 		make<locks::CRecursiveSpinlock>("CRecursiveSpinlock", true),
+		make<locks::v1::CRecursiveSpinlock>("v1::CRecursiveSpinlock", true),
 		make<boost::recursive_mutex>("boost::recursive_mutex", true),
 		make<std::recursive_mutex>("std::recursive_mutex", true),
 	};
@@ -227,7 +322,7 @@ int main(int argc, char **argv)
 
 	if (opt.csv)
 	{
-		std::printf("workload,lock,threads,ns_per_op,mops_per_sec\n");
+		std::printf("kind,workload,lock,threads,ns_per_op,mops_per_sec,min_share,max_share\n");
 	}
 	else
 	{
@@ -275,11 +370,61 @@ int main(int argc, char **argv)
 				const double ns = median(samples);
 				if (opt.csv)
 				{
-					std::printf("%s,%s,%u,%.2f,%.3f\n", w.name, c->name, t, ns, 1000.0 / ns);
+					std::printf("throughput,%s,%s,%u,%.2f,%.3f,,\n", w.name, c->name, t, ns, 1000.0 / ns);
 				}
 				else
 				{
 					std::printf("%10.1f", ns);
+					std::fflush(stdout);
+				}
+			}
+			if (!opt.csv)
+			{
+				std::printf("\n");
+			}
+		}
+	}
+
+	if (opt.fairnessMs > 0)
+	{
+		// Only contended thread counts are interesting here.
+		std::vector<unsigned> fthreads;
+		for (unsigned t : opt.threads)
+		{
+			if (t > 1)
+			{
+				fthreads.push_back(t);
+			}
+		}
+		if (!opt.csv)
+		{
+			std::printf("\n== fairness: tiny workload, %u ms per run ==\n"
+						"cells: Mops/s total | min/mean per-thread share (1.00 = even)\n%-24s",
+						opt.fairnessMs, "lock \\ threads");
+			for (unsigned t : fthreads)
+			{
+				std::printf("%16u", t);
+			}
+			std::printf("\n");
+		}
+		for (const auto &c : candidates)
+		{
+			if (!opt.csv)
+			{
+				std::printf("%-24s", c.name);
+				std::fflush(stdout);
+			}
+			for (unsigned t : fthreads)
+			{
+				const FairnessResult r = c.fairness(t, opt.fairnessMs);
+				if (opt.csv)
+				{
+					std::printf("fairness,tiny,%s,%u,%.2f,%.3f,%.3f,%.3f\n", c.name, t,
+								1000.0 / r.mopsPerSec, r.mopsPerSec, r.minShare, r.maxShare);
+				}
+				else
+				{
+					std::printf("%9.1f | %4.2f", r.mopsPerSec, r.minShare);
 					std::fflush(stdout);
 				}
 			}

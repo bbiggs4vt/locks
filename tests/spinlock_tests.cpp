@@ -4,10 +4,15 @@
 
 #include <locks/spinlock.hpp>
 
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
+
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 namespace
@@ -105,6 +110,110 @@ void testRecursiveSpinlockMutualExclusion()
 
 	check(counter == 2 * threads * iters, "CRecursiveSpinlock mutual exclusion with nesting");
 }
+
+void testScopedLockEarlyUnlock()
+{
+	// Previously the guard's destructor unlocked again after a manual
+	// unlock(), releasing a lock that another thread had since acquired.
+	locks::CSpinlock lock;
+	bool stillHeldByOther = false;
+	{
+		locks::CSpinlock::scoped_lock guard(lock);
+		guard.unlock();
+		check(!guard.owns_lock(), "scoped_lock::owns_lock false after unlock");
+
+		std::thread other([&] { lock.lock(); });
+		other.join();
+		// `other` exited holding the lock; the guard must not release it.
+	}
+	stillHeldByOther = !lock.try_lock();
+	check(stillHeldByOther, "scoped_lock destructor does not unlock after early unlock()");
+	lock.unlock();
+
+	locks::CRecursiveSpinlock rlock;
+	{
+		locks::CRecursiveSpinlock::scoped_lock guard(rlock);
+		guard.unlock();
+		guard.lock();
+		check(guard.owns_lock(), "recursive scoped_lock relock after unlock");
+	}
+	bool freeAfter = false;
+	std::thread([&] {
+		freeAfter = rlock.try_lock();
+		if (freeAfter)
+		{
+			rlock.unlock();
+		}
+	}).join();
+	check(freeAfter, "recursive scoped_lock releases exactly once");
+}
+
+template <typename Lock>
+bool tryLockFromOtherThread(Lock &lock)
+{
+	bool got = false;
+	std::thread([&] {
+		got = lock.try_lock();
+		if (got)
+		{
+			lock.unlock();
+		}
+	}).join();
+	return got;
+}
+
+void testTryLock()
+{
+	locks::CSpinlock lock;
+	check(lock.try_lock(), "CSpinlock::try_lock succeeds when free");
+	check(!lock.try_lock(), "CSpinlock::try_lock fails when held (non-recursive)");
+	check(!tryLockFromOtherThread(lock), "CSpinlock::try_lock fails from another thread when held");
+	lock.unlock();
+	check(tryLockFromOtherThread(lock), "CSpinlock::try_lock succeeds from another thread after unlock");
+
+	locks::CRecursiveSpinlock rlock;
+	check(rlock.try_lock(), "CRecursiveSpinlock::try_lock succeeds when free");
+	check(rlock.try_lock(), "CRecursiveSpinlock::try_lock re-enters for owner");
+	check(!tryLockFromOtherThread(rlock), "CRecursiveSpinlock::try_lock fails from another thread when held");
+	rlock.unlock();
+	check(!tryLockFromOtherThread(rlock), "CRecursiveSpinlock still held after one of two unlocks");
+	rlock.unlock();
+	check(tryLockFromOtherThread(rlock), "CRecursiveSpinlock free after matching unlocks");
+}
+
+void testStdLockCompatibility()
+{
+	locks::CSpinlock a;
+	locks::CRecursiveSpinlock b;
+	{
+		std::unique_lock<locks::CSpinlock> ua(a, std::defer_lock);
+		std::unique_lock<locks::CRecursiveSpinlock> ub(b, std::defer_lock);
+		std::lock(ua, ub); // needs try_lock
+		check(ua.owns_lock() && ub.owns_lock(), "std::lock works with both spinlocks");
+	}
+	check(tryLockFromOtherThread(a) && tryLockFromOtherThread(b), "std::unique_lock releases both spinlocks");
+	check(alignof(locks::CSpinlock) == 64 && alignof(locks::CRecursiveSpinlock) == 64,
+		  "spinlocks are cache-line aligned");
+}
+
+void testUnlockByNonOwnerAborts()
+{
+	// Run in a child process: unlocking from a thread that does not own the
+	// lock must abort (in release builds too) instead of corrupting it.
+	std::fflush(stdout);
+	const pid_t pid = fork();
+	if (pid == 0)
+	{
+		locks::CRecursiveSpinlock lock;
+		lock.lock();
+		std::thread([&] { lock.unlock(); }).join();
+		_exit(0); // should not get here
+	}
+	int status = 0;
+	waitpid(pid, &status, 0);
+	check(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+		  "CRecursiveSpinlock::unlock by non-owner aborts");
+}
 } // namespace
 
 int main()
@@ -112,6 +221,10 @@ int main()
 	testSpinlockMutualExclusion();
 	testRecursiveSpinlockReentry();
 	testRecursiveSpinlockMutualExclusion();
+	testScopedLockEarlyUnlock();
+	testTryLock();
+	testStdLockCompatibility();
+	testUnlockByNonOwnerAborts();
 
 	if (gFailures != 0)
 	{
