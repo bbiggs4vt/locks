@@ -9,39 +9,111 @@
 #include <boost/thread/thread.hpp>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#define LOCKS_ARCH_X86 1
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define LOCKS_ARCH_AARCH64 1
+#elif defined(__arm__) || defined(_M_ARM)
+#define LOCKS_ARCH_ARM32 1
+#endif
+
+//! Upper bound of the exponential spin backoff, in relax() calls per round,
+//! before a waiter falls back to yielding its time slice (a syscall).
+//! Override with -DLOCKS_SPIN_MAX_BACKOFF=N to tune for a target.
+#ifndef LOCKS_SPIN_MAX_BACKOFF
+#define LOCKS_SPIN_MAX_BACKOFF 64
 #endif
 
 namespace locks
 {
+	//! Spin-wait hints: what a waiter executes between checks of the lock.
+	namespace relax
+	{
+		//! x86 PAUSE. Saves power, frees resources for a sibling hyper-thread
+		//! and avoids the memory-order mis-speculation penalty on loop exit.
+		//! Elsewhere falls back to a compiler barrier.
+		struct Pause
+		{
+			static const char *name() { return "pause"; }
+			static void relax()
+			{
+#if defined(LOCKS_ARCH_X86)
+				_mm_pause();
+#else
+				__asm__ __volatile__("" ::: "memory");
+#endif
+			}
+		};
+
+		//! ARM YIELD. Architecturally a hint for SMT cores; most Cortex-A
+		//! cores execute it as a NOP, so it adds almost no delay.
+		struct Yield
+		{
+			static const char *name() { return "yield"; }
+			static void relax()
+			{
+#if defined(LOCKS_ARCH_AARCH64) || defined(LOCKS_ARCH_ARM32)
+				__asm__ __volatile__("yield" ::: "memory");
+#else
+				__asm__ __volatile__("" ::: "memory");
+#endif
+			}
+		};
+
+		//! AArch64 ISB SY. Flushes the pipeline, so unlike YIELD it actually
+		//! stalls the core for a short, roughly fixed time (Rust's
+		//! core::hint::spin_loop uses this on AArch64).
+		struct Isb
+		{
+			static const char *name() { return "isb"; }
+			static void relax()
+			{
+#if defined(LOCKS_ARCH_AARCH64)
+				__asm__ __volatile__("isb sy" ::: "memory");
+#elif defined(LOCKS_ARCH_ARM32)
+				__asm__ __volatile__("yield" ::: "memory");
+#else
+				__asm__ __volatile__("" ::: "memory");
+#endif
+			}
+		};
+
+		//! Best hint for the architecture being compiled for.
+#if defined(LOCKS_ARCH_AARCH64)
+		typedef Isb Default;
+#elif defined(LOCKS_ARCH_ARM32)
+		typedef Yield Default;
+#else
+		typedef Pause Default;
+#endif
+	} // namespace relax
+
+	//! Spin-wait policy: which hint to execute and how far to back off
+	//! before yielding the time slice.
+	template <typename Relax = relax::Default, uint32_t MaxBackoff = LOCKS_SPIN_MAX_BACKOFF>
+	struct SpinPolicy
+	{
+		typedef Relax relax_type;
+		static const uint32_t kMaxBackoff = MaxBackoff;
+	};
+
 	namespace detail
 	{
-		//! Tell the CPU we are in a spin-wait loop (x86 PAUSE / ARM YIELD).
-		//! Saves power, frees resources for a sibling hyper-thread and avoids
-		//! the memory-order mis-speculation penalty when the loop exits.
-		inline void cpuRelax()
-		{
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-			_mm_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-			__asm__ __volatile__("yield" ::: "memory");
-#endif
-		}
-
-		//! Spin-wait strategy: exponential backoff with cpuRelax() for a
-		//! bounded number of rounds, then fall back to yielding the time slice.
+		//! Exponential backoff with Policy::relax_type::relax() for a bounded
+		//! number of rounds, then fall back to yielding the time slice.
 		//! Yielding is a syscall, so it is only used once spinning has failed
 		//! for a while (the holder is probably descheduled).
+		template <typename Policy>
 		class Backoff
 		{
 		public:
 			void pause()
 			{
-				if (mSpins <= kMaxSpins)
+				if (mSpins <= Policy::kMaxBackoff)
 				{
 					for (uint32_t i = 0; i < mSpins; ++i)
 					{
-						cpuRelax();
+						Policy::relax_type::relax();
 					}
 					mSpins <<= 1;
 				}
@@ -52,13 +124,12 @@ namespace locks
 			}
 
 		private:
-			static const uint32_t kMaxSpins = 64;
 			uint32_t mSpins = 1;
 		};
 
 		//! Generic RAII guard used as Lock::scoped_lock.
-		//! Unlike the previous guard it tracks ownership, so an early
-		//! unlock() is not repeated by the destructor.
+		//! It tracks ownership, so an early unlock() is not repeated by the
+		//! destructor.
 		template <typename Lock>
 		class ScopedLock : boost::noncopyable
 		{
@@ -110,7 +181,8 @@ namespace locks
 		};
 	} // namespace detail
 
-	//! CSpinlock is a lightweight, non-recursive mutex.
+	//! BasicSpinlock is a lightweight, non-recursive mutex.
+	//! Use the CSpinlock typedef unless you are tuning the spin policy.
 	//!
 	//! Test-and-test-and-set with backoff: waiters spin on a plain load (which
 	//! stays in their own cache) and only attempt the atomic exchange when the
@@ -122,12 +194,13 @@ namespace locks
 	//! Aligned to a cache line to avoid false sharing with neighbouring data.
 	//! Use for short critical sections with fewer threads than cores;
 	//! otherwise prefer a regular mutex.
-	class alignas(64) CSpinlock : boost::noncopyable
+	template <typename Policy = SpinPolicy<> >
+	class alignas(64) BasicSpinlock : boost::noncopyable
 	{
 	public:
-		typedef detail::ScopedLock<CSpinlock> scoped_lock;
+		typedef detail::ScopedLock<BasicSpinlock> scoped_lock;
 
-		CSpinlock()
+		BasicSpinlock()
 			: mLocked(false)
 		{
 		}
@@ -140,7 +213,7 @@ namespace locks
 				return;
 			}
 
-			detail::Backoff backoff;
+			detail::Backoff<Policy> backoff;
 			for (;;)
 			{
 				while (mLocked.load(boost::memory_order_relaxed))
@@ -170,8 +243,9 @@ namespace locks
 		boost::atomic<bool> mLocked;
 	};
 
-	//! CRecursiveSpinlock is a spinlock that the owning thread may lock
+	//! BasicRecursiveSpinlock is a spinlock that the owning thread may lock
 	//! multiple times; it must unlock it the same number of times.
+	//! Use the CRecursiveSpinlock typedef unless you are tuning the spin policy.
 	//!
 	//! The lock is the CAS of mOwner from "no thread" to the caller's id.
 	//! Only the owning thread ever stores its own id, so a thread can test
@@ -180,12 +254,13 @@ namespace locks
 	//!
 	//! Cost: one CAS to acquire, a plain store to release, no atomics at all
 	//! for a re-entrant lock/unlock.
-	class alignas(64) CRecursiveSpinlock : boost::noncopyable
+	template <typename Policy = SpinPolicy<> >
+	class alignas(64) BasicRecursiveSpinlock : boost::noncopyable
 	{
 	public:
-		typedef detail::ScopedLock<CRecursiveSpinlock> scoped_lock;
+		typedef detail::ScopedLock<BasicRecursiveSpinlock> scoped_lock;
 
-		CRecursiveSpinlock()
+		BasicRecursiveSpinlock()
 			: mOwner(boost::thread::id())
 			, mRecursion(0)
 		{
@@ -200,7 +275,7 @@ namespace locks
 				return;
 			}
 
-			detail::Backoff backoff;
+			detail::Backoff<Policy> backoff;
 			for (;;)
 			{
 				boost::thread::id unowned;
@@ -268,4 +343,8 @@ namespace locks
 		boost::atomic<boost::thread::id> mOwner; //!< Owning thread, or default id when free
 		uint32_t mRecursion; //!< Times the owner has entered; only accessed by the owner
 	};
+
+	//! The spinlocks with the default policy for the target architecture.
+	typedef BasicSpinlock<> CSpinlock;
+	typedef BasicRecursiveSpinlock<> CRecursiveSpinlock;
 } // namespace locks

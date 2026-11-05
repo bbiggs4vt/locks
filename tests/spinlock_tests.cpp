@@ -196,6 +196,43 @@ void testStdLockCompatibility()
 		  "spinlocks are cache-line aligned");
 }
 
+template <typename Lock>
+bool hammer(unsigned threads, uint64_t iters, bool nested)
+{
+	Lock lock;
+	uint64_t counter = 0;
+	runThreads(threads, [&] {
+		for (uint64_t i = 0; i < iters; ++i)
+		{
+			typename Lock::scoped_lock outer(lock);
+			++counter;
+			if (nested)
+			{
+				typename Lock::scoped_lock inner(lock);
+				++counter;
+			}
+		}
+	});
+	return counter == threads * iters * (nested ? 2 : 1);
+}
+
+void testSpinPolicies()
+{
+	// Every hint must compile and keep mutual exclusion on every
+	// architecture (hints that do not apply fall back to a barrier).
+	// A tiny backoff limit forces the yield() fallback path too.
+	using namespace locks;
+	check(hammer<BasicSpinlock<SpinPolicy<relax::Pause, 4> > >(8, 20000, false), "BasicSpinlock<Pause>");
+	check(hammer<BasicSpinlock<SpinPolicy<relax::Yield, 4> > >(8, 20000, false), "BasicSpinlock<Yield>");
+	check(hammer<BasicSpinlock<SpinPolicy<relax::Isb, 4> > >(8, 20000, false), "BasicSpinlock<Isb>");
+	check(hammer<BasicSpinlock<SpinPolicy<relax::Default, 1024> > >(8, 20000, false), "BasicSpinlock<Default, 1024>");
+	check(hammer<BasicRecursiveSpinlock<SpinPolicy<relax::Pause, 4> > >(8, 20000, true), "BasicRecursiveSpinlock<Pause>");
+	check(hammer<BasicRecursiveSpinlock<SpinPolicy<relax::Yield, 4> > >(8, 20000, true), "BasicRecursiveSpinlock<Yield>");
+	check(hammer<BasicRecursiveSpinlock<SpinPolicy<relax::Isb, 4> > >(8, 20000, true), "BasicRecursiveSpinlock<Isb>");
+	check(hammer<BasicRecursiveSpinlock<SpinPolicy<relax::Default, 1024> > >(8, 20000, true),
+		  "BasicRecursiveSpinlock<Default, 1024>");
+}
+
 void testUnlockByNonOwnerAborts()
 {
 	// Run in a child process: unlocking from a thread that does not own the
@@ -224,6 +261,7 @@ int main()
 	testScopedLockEarlyUnlock();
 	testTryLock();
 	testStdLockCompatibility();
+	testSpinPolicies();
 	testUnlockByNonOwnerAborts();
 
 	if (gFailures != 0)

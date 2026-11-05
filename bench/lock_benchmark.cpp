@@ -13,7 +13,8 @@
 // even, 0.00 = some thread never got the lock).
 //
 // The previous spinlock implementation (bench/spinlock_v1.hpp) is included
-// as "v1::..." for comparison.
+// as "v1::..." for comparison, plus spin-policy variants of the current
+// locks ("[hint]" / "[backoffN]") for tuning on a given target.
 //
 // Usage:
 //   lock_benchmark [--ops N] [--reps N] [--threads 1,2,4,8] [--fairness-ms N] [--csv]
@@ -234,6 +235,35 @@ double median(std::vector<double> v)
 	return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+void printBuildInfo()
+{
+#if defined(__aarch64__)
+	const char *arch = "aarch64";
+#elif defined(__arm__)
+	const char *arch = "arm32";
+#elif defined(__x86_64__)
+	const char *arch = "x86_64";
+#elif defined(__i386__)
+	const char *arch = "x86";
+#else
+	const char *arch = "unknown";
+#endif
+#if defined(__ARM_FEATURE_ATOMICS)
+	const char *atomics = "LSE (inline swp/cas)";
+#elif defined(__aarch64__)
+	const char *atomics = "no LSE at compile time (LL/SC loops, or outline-atomics calls if enabled)";
+#else
+	const char *atomics = "native";
+#endif
+#if defined(__VERSION__)
+	const char *compiler = __VERSION__;
+#else
+	const char *compiler = "unknown";
+#endif
+	std::printf("# build: arch=%s compiler=\"%s\" atomics=%s default_hint=%s max_backoff=%u\n",
+				arch, compiler, atomics, locks::relax::Default::name(), unsigned(LOCKS_SPIN_MAX_BACKOFF));
+}
+
 std::vector<unsigned> parseList(const char *s)
 {
 	std::vector<unsigned> out;
@@ -305,10 +335,18 @@ int main(int argc, char **argv)
 
 	const std::vector<Candidate> candidates = {
 		make<locks::CSpinlock>("CSpinlock", false),
+#if defined(__aarch64__) || defined(__arm__)
+		make<locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Yield> > >("CSpinlock[yield]", false),
+#endif
+		make<locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Default, 1024> > >("CSpinlock[backoff1024]", false),
 		make<locks::v1::CSpinlock>("v1::CSpinlock", false),
 		make<boost::mutex>("boost::mutex", false),
 		make<std::mutex>("std::mutex", false),
 		make<locks::CRecursiveSpinlock>("CRecursiveSpinlock", true),
+#if defined(__aarch64__) || defined(__arm__)
+		make<locks::BasicRecursiveSpinlock<locks::SpinPolicy<locks::relax::Yield> > >("CRecursiveSpinlock[yield]", true),
+#endif
+		make<locks::BasicRecursiveSpinlock<locks::SpinPolicy<locks::relax::Default, 1024> > >("CRecursiveSpinlock[backoff1024]", true),
 		make<locks::v1::CRecursiveSpinlock>("v1::CRecursiveSpinlock", true),
 		make<boost::recursive_mutex>("boost::recursive_mutex", true),
 		make<std::recursive_mutex>("std::recursive_mutex", true),
@@ -320,6 +358,7 @@ int main(int argc, char **argv)
 		{"nested", 0, true},      // lock taken twice per op (recursive locks only)
 	};
 
+	printBuildInfo();
 	if (opt.csv)
 	{
 		std::printf("kind,workload,lock,threads,ns_per_op,mops_per_sec,min_share,max_share\n");
@@ -343,7 +382,7 @@ int main(int argc, char **argv)
 
 		if (!opt.csv)
 		{
-			std::printf("\n== workload: %s ==\n%-24s", w.name, "lock \\ threads");
+			std::printf("\n== workload: %s ==\n%-32s", w.name, "lock \\ threads");
 			for (unsigned t : opt.threads)
 			{
 				std::printf("%10u", t);
@@ -355,7 +394,7 @@ int main(int argc, char **argv)
 		{
 			if (!opt.csv)
 			{
-				std::printf("%-24s", c->name);
+				std::printf("%-32s", c->name);
 				std::fflush(stdout);
 			}
 			for (unsigned t : opt.threads)
@@ -399,7 +438,7 @@ int main(int argc, char **argv)
 		if (!opt.csv)
 		{
 			std::printf("\n== fairness: tiny workload, %u ms per run ==\n"
-						"cells: Mops/s total | min/mean per-thread share (1.00 = even)\n%-24s",
+						"cells: Mops/s total | min/mean per-thread share (1.00 = even)\n%-32s",
 						opt.fairnessMs, "lock \\ threads");
 			for (unsigned t : fthreads)
 			{
@@ -411,7 +450,7 @@ int main(int argc, char **argv)
 		{
 			if (!opt.csv)
 			{
-				std::printf("%-24s", c.name);
+				std::printf("%-32s", c.name);
 				std::fflush(stdout);
 			}
 			for (unsigned t : fthreads)

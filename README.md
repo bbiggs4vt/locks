@@ -29,6 +29,27 @@ locks::CSpinlock lock;
 
 Use them only for short critical sections, with fewer threads than cores. Otherwise use a regular mutex (see the results below).
 
+### Spin policy
+
+`CSpinlock` and `CRecursiveSpinlock` are typedefs for `BasicSpinlock<>` and `BasicRecursiveSpinlock<>`, using the default `SpinPolicy` for the CPU being compiled for. Because they are now typedefs, a forward declaration such as `class CSpinlock;` no longer compiles; include the header instead.
+
+A `SpinPolicy<Relax, MaxBackoff>` sets two things:
+
+- **The hint a waiter executes between checks:**
+
+  | hint | instruction | default on |
+  |---|---|---|
+  | `relax::Pause` | x86 `pause` | x86 |
+  | `relax::Isb` | AArch64 `isb sy` | AArch64 |
+  | `relax::Yield` | ARM `yield` | 32-bit ARM |
+
+  Most Cortex-A cores treat `yield` as a no-op, so it adds almost no delay. `isb` really stalls the core briefly, which is why it is the AArch64 default; Rust's spin loop uses it too. On a CPU a hint doesn't apply to, it compiles to a plain compiler barrier.
+- **The backoff limit:** the number of hint calls per round before the waiter gives up and calls `yield()`, which is a syscall. Each round doubles until it reaches the limit. The default is 64. You can override it globally with `-DLOCKS_SPIN_MAX_BACKOFF=N`, or per lock:
+
+```cpp
+typedef locks::BasicSpinlock<locks::SpinPolicy<locks::relax::Yield, 256> > MySpinlock;
+```
+
 ## Build
 
 You need CMake 3.14 or later, a C++17 compiler, and Boost (`thread` and `atomic`). On Debian or Ubuntu:
@@ -40,6 +61,20 @@ cmake --build build -j
 ctest --test-dir build       # correctness tests (asserts always enabled)
 ./build/lock_benchmark       # performance comparison
 ```
+
+### Building on the target (e.g. ARM)
+
+```sh
+cmake -S . -B build -DLOCKS_NATIVE_CPU=ON   # -mcpu=native on ARM, -march=native on x86
+cmake --build build -j
+ctest --test-dir build
+./build/lock_benchmark | tee results.txt     # or --csv
+```
+
+- **`LOCKS_NATIVE_CPU`** matters on ARM. On ARMv8.1+ cores (Cortex-A55/A76, Raspberry Pi 5 and newer) it lets atomic operations compile to single LSE instructions (`swp`/`cas`). On ARMv8.0 cores (Cortex-A53/A72, Raspberry Pi 3/4) those cores have no such instructions, and GCC's default `-moutline-atomics` turns every atomic operation into a library call that picks an implementation at runtime.
+- **`-DLOCKS_SPIN_MAX_BACKOFF=N`** changes the default backoff limit.
+
+The first line of the benchmark output records the architecture, compiler, atomic implementation, default hint and backoff limit, so keep it with any results you share.
 
 ## Benchmark
 
@@ -59,7 +94,10 @@ It compares:
 
 - `CSpinlock` with `boost::mutex` and `std::mutex`
 - `CRecursiveSpinlock` with `boost::recursive_mutex` and `std::recursive_mutex`
-- the previous implementation, as `v1::...` (`bench/spinlock_v1.hpp`)
+- the previous implementation, as `v1::...` (`bench/spinlock_v1.hpp`). This is the code as originally provided, with one change: the race fix on `CRecursiveSpinlock`'s uncontended path. Without it the benchmark stops with "lost updates".
+- spin-policy variants of the current locks:
+  - `[backoff1024]`: a 16× longer backoff before yielding;
+  - `[yield]`: on ARM only, the `yield` hint instead of the default `isb`.
 
 By default the thread counts run 1, 2, 4, … up to the core count, then 2× the core count to show oversubscription.
 
@@ -73,7 +111,7 @@ Options:
 
 ### Results
 
-These come from a 4-vCPU cloud VM, GCC 13, Boost 1.83, run with `--ops 100000 --reps 3`. The VM is noisy, so each cell shows the range across two full runs. Numbers are ns per acquisition, lower is better.
+These come from a 4-vCPU x86 cloud VM (GCC 13, Boost 1.83), run with `--ops 100000 --reps 3`, before the spin-policy variants were added. There are no ARM results yet. The VM is noisy, so each cell shows the range across two full runs. Numbers are ns per acquisition, lower is better.
 
 | | 1 thread | 2 | 4 | 8 |
 |---|---|---|---|---|
