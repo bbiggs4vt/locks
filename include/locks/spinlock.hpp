@@ -155,8 +155,17 @@ namespace locks
 				return;
 			}
 
-			// Just owned the lock when there was no owner
-			mOwner = tid;
+			// The lock looked free, but ownership must still be claimed
+			// with a CAS. A plain `mOwner = tid` here races with a
+			// contender that incremented mCounter just after us: it sees
+			// mOwner still unowned, wins its CAS, and then both threads
+			// believe they hold the lock.
+			auto unowned = mUnownedId;
+			while (!mOwner.compare_exchange_strong(unowned, tid))
+			{
+				unowned = mUnownedId;
+				boost::this_thread::yield();
+			}
 			++mRecursion;
 		}
 		void unlock()
